@@ -12,6 +12,9 @@ const pool = genericPool.createPool(
       const container = await docker.createContainer({
         Image: 'ubuntu',
         Cmd: ['sleep', '100000'],
+        HostConfig: {
+          AutoRemove: true,
+        },
       });
 
       await container.start();
@@ -31,7 +34,6 @@ const pool = genericPool.createPool(
     },
     destroy: async (container) => {
       await container.stop();
-      await container.remove();
     },
   },
   {
@@ -47,6 +49,39 @@ pool.on('factoryCreateError', (err) => {
 pool.on('factoryDestroyError', (err) => {
   console.error('Error destroying container', err);
 });
+
+/** @type {Set<CodeCaller>} */
+let unhealthyCodeCallers = new Set();
+
+async function getHealthyCodeCaller() {
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const codeCaller = await pool.acquire();
+    if (!unhealthyCodeCallers.has(codeCaller)) {
+      return codeCaller;
+    }
+    await pool.release(codeCaller);
+    await sleep(0);
+  }
+}
+
+function destroyUnhealthyCodeCallers() {
+  unhealthyCodeCallers.forEach((codeCaller) => {
+    // Delete from the set first. That way, if `pool.destroy()` is still running
+    // on the next tick of this `destroyUnhealthyCodeCallers()` function, we
+    // won't try to destroy it again.
+    unhealthyCodeCallers.delete(codeCaller);
+    console.log('destroying unhealthy container', codeCaller);
+    pool.destroy(codeCaller).catch((err) => {
+      logger.error('Error destroying unhealthy container', err);
+      Sentry.captureException(err);
+    });
+  });
+
+  setTimeout(destroyUnhealthyCodeCallers, 100);
+}
+
+destroyUnhealthyCodeCallers();
 
 Sentry.init();
 
@@ -78,7 +113,7 @@ app.get(
 
     let reuseContainer = requestCount < 5;
 
-    const container = await pool.acquire();
+    const container = await getHealthyCodeCaller();
     console.log('container acquired');
 
     if (reuseContainer) {
@@ -86,7 +121,7 @@ app.get(
       await pool.release(container);
     } else {
       requestCount = 0;
-      await pool.destroy(container);
+      unhealthyCodeCallers.add(container);
     }
 
     res.send(reuseContainer ? 'Reused' : 'New');
