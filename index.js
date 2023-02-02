@@ -2,10 +2,54 @@ const express = require('express');
 const asyncHandler = require('express-async-handler');
 const Sentry = require('@sentry/node');
 const Docker = require('dockerode');
+const genericPool = require('generic-pool');
+
+const docker = new Docker();
+
+const pool = genericPool.createPool(
+  {
+    create: async () => {
+      const container = await docker.createContainer({
+        Image: 'ubuntu',
+        Cmd: ['sleep', '100000'],
+      });
+
+      await container.start();
+
+      console.log('container started');
+
+      container
+        .wait()
+        .then(() => {
+          console.log('Container exited');
+        })
+        .catch((err) => {
+          console.error('Container wait error', err);
+        });
+
+      return container;
+    },
+    destroy: async (container) => {
+      await container.stop();
+      await container.remove();
+    },
+  },
+  {
+    min: 2,
+    max: 2,
+  }
+);
+
+pool.on('factoryCreateError', (err) => {
+  console.error('Error creating container', err);
+});
+
+pool.on('factoryDestroyError', (err) => {
+  console.error('Error destroying container', err);
+});
 
 Sentry.init();
 
-const docker = new Docker();
 const app = express();
 
 app.use(Sentry.Handlers.requestHandler());
@@ -23,6 +67,8 @@ function makeRandomString(length) {
   return result;
 }
 
+let requestCount = 0;
+
 app.get(
   '/',
   asyncHandler(async (req, res) => {
@@ -30,24 +76,24 @@ app.get(
       .fill(0)
       .map(() => makeRandomString(100));
 
-    const container = await docker.createContainer({
-      Image: 'ubuntu',
-      Cmd: ['sleep', '100000'],
-    });
+    let reuseContainer = requestCount < 5;
 
-    await container.start();
+    const container = await pool.acquire();
+    console.log('container acquired');
 
-    container
-      .wait()
-      .then(() => {
-        console.log('Container exited');
-      })
-      .catch((err) => {
-        console.error('Container wait error', err);
-      });
+    if (reuseContainer) {
+      requestCount += 1;
+      await pool.release(container);
+    } else {
+      requestCount = 0;
+      await pool.destroy(container);
+    }
 
-    res.send('Hello world!');
+    res.send(reuseContainer ? 'Reused' : 'New');
   })
 );
 
-app.listen(80);
+pool.ready().then(() => {
+  app.listen(80);
+  console.log('server started');
+});
